@@ -1,0 +1,370 @@
+
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
+
+const supabase = require('../lib/supabase');
+const { generateToken, generateReferralCode, authMiddleware, ownerOnly, adminOnly } = require('../lib/auth');
+
+const app = express();
+app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// HEALTH
+app.get('/', (req, res) => res.json({ message: 'BLACK CARD Backend Live - Real Business API - Nigeria', version: 'V2', manual_auto_toggle: 'enabled', referral_unlock: 'enabled' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+// ========== AUTH ==========
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { full_name, email, password, referral_code: usedReferralCode } = req.body;
+    if (!full_name || !email || !password) return res.status(400).json({ error: 'Full name, email, password required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password min 6 chars' });
+
+    const { data: existing } = await supabase.from('users').select('id').eq('email', email.toLowerCase()).single();
+    if (existing) return res.status(400).json({ error: 'Email already registered' });
+
+    let referred_by = null;
+    if (usedReferralCode) {
+      const { data: referrer } = await supabase.from('users').select('id, is_referral_eligible, is_suspended').eq('referral_code', usedReferralCode.toUpperCase()).single();
+      if (!referrer) return res.status(400).json({ error: 'Invalid referral code' });
+      if (referrer.is_suspended) return res.status(400).json({ error: 'Referrer account suspended' });
+      // Prevent self referral check done via different email, but also check flag
+      if (!referrer.is_referral_eligible) {
+        // Still allow registration but referrer won't get reward until referrer is eligible - handled later
+      }
+      referred_by = referrer.id;
+    }
+
+    const password_hash = await bcrypt.hash(password, 10);
+    const referral_code = generateReferralCode();
+    
+    const { data: user, error } = await supabase.from('users').insert({
+      full_name, email: email.toLowerCase(), password_hash, referral_code, referred_by,
+      is_email_verified: false, is_referral_eligible: false, is_withdrawal_eligible: false
+    }).select().single();
+    if (error) throw error;
+
+    // Create wallet
+    await supabase.from('wallets').insert({ user_id: user.id, available_balance: 0, pending_balance: 0, reserved_balance: 0 });
+
+    // If referred, create referral record (not qualified yet)
+    if (referred_by) {
+      await supabase.from('referrals').insert({
+        referrer_id: referred_by, referred_id: user.id, referral_code_used: usedReferralCode.toUpperCase(), is_qualified: false
+      });
+    }
+
+    const token = generateToken(user, 'user');
+    res.json({ message: 'Registered. Please verify email and purchase membership to unlock referral & withdrawal.', user: { id: user.id, email: user.email, referral_code: user.referral_code, is_referral_eligible: false }, token });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { data: user } = await supabase.from('users').select('*').eq('email', email.toLowerCase()).single();
+    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+    if (user.is_suspended) return res.status(403).json({ error: 'Account suspended' });
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(400).json({ error: 'Invalid credentials' });
+    const token = generateToken(user, 'user');
+    res.json({ token, user: { id: user.id, full_name: user.full_name, email: user.email, referral_code: user.referral_code, is_referral_eligible: user.is_referral_eligible, is_withdrawal_eligible: user.is_withdrawal_eligible } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/auth/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { data: admin } = await supabase.from('admins').select('*').eq('email', email.toLowerCase()).single();
+    if (!admin) return res.status(400).json({ error: 'Invalid admin credentials' });
+    const valid = await bcrypt.compare(password, admin.password_hash);
+    if (!valid) return res.status(400).json({ error: 'Invalid credentials' });
+    const token = generateToken(admin, admin.role);
+    res.json({ token, admin: { id: admin.id, email: admin.email, role: admin.role } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========== MEMBERSHIPS ==========
+app.get('/api/memberships', async (req, res) => {
+  const { data, error } = await supabase.from('memberships').select('*').eq('is_active', true).is('deleted_at', null).order('price_ngn');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// ========== PURCHASES - REAL BUSINESS LOGIC ==========
+app.post('/api/purchases/create', authMiddleware, async (req, res) => {
+  try {
+    const { tier, network } = req.body;
+    if (!tier || !network) return res.status(400).json({ error: 'Tier and network required' });
+
+    // Check email verified flag
+    const { data: flag } = await supabase.from('feature_flags').select('is_enabled').eq('key', 'require_email_verified_for_purchase').single();
+    if (flag?.is_enabled) {
+      const { data: user } = await supabase.from('users').select('is_email_verified').eq('id', req.user.id).single();
+      if (!user?.is_email_verified) return res.status(403).json({ error: 'Verify email before purchase' });
+    }
+
+    // Get membership
+    const { data: membership } = await supabase.from('memberships').select('*').eq('tier', tier).eq('network', network).single();
+    if (!membership) return res.status(404).json({ error: 'Membership not found' });
+
+    // Enforce upgrade only - check existing active memberships
+    const { data: existingMemberships } = await supabase.from('user_memberships').select('tier').eq('user_id', req.user.id).eq('is_active', true).is('deleted_at', null);
+    const order = { Premium: 1, Silver: 2, Gold: 3, Diamond: 4 };
+    if (existingMemberships?.length) {
+      const maxTier = Math.max(...existingMemberships.map(m => order[m.tier] || 0));
+      if (order[tier] <= maxTier) return res.status(400).json({ error: `Downgrade prohibited. You already have higher or equal tier. Allowed: upgrade only.` });
+    }
+
+    const purchase_reference = 'BC-' + Date.now() + '-' + Math.random().toString(36).substring(2,6).toUpperCase();
+    const now = new Date();
+    const deadline24h = new Date(now.getTime() + 24*60*60*1000);
+    const deadline1month = new Date(deadline24h.getTime() + 30*24*60*60*1000);
+
+    const { data: purchase, error } = await supabase.from('purchases').insert({
+      purchase_reference, user_id: req.user.id, membership_id: membership.id,
+      tier, network, amount_ngn: membership.price_ngn, selar_link: membership.selar_link,
+      status: 'pending_evidence', evidence_deadline_24h: deadline24h, evidence_deadline_1month: deadline1month
+    }).select().single();
+    if (error) throw error;
+
+    res.json({ message: 'Purchase initiated. Redirect to Selar and submit evidence.', purchase, selar_link: membership.selar_link });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/purchases/:id/proof', authMiddleware, async (req, res) => {
+  try {
+    const { screenshot_url, email_confirmation_url } = req.body;
+    const purchaseId = req.params.id;
+    if (!screenshot_url) return res.status(400).json({ error: 'Screenshot required' });
+
+    const { data: purchase } = await supabase.from('purchases').select('*').eq('id', purchaseId).eq('user_id', req.user.id).single();
+    if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
+    if (['approved','expired'].includes(purchase.status)) return res.status(400).json({ error: 'Purchase already finalized' });
+
+    const { data: proof } = await supabase.from('payment_proofs').insert({
+      purchase_id: purchaseId, user_id: req.user.id, screenshot_url, email_confirmation_url, verification_status: 'pending'
+    }).select().single();
+
+    await supabase.from('purchases').update({ status: 'evidence_submitted', updated_at: new Date().toISOString() }).eq('id', purchaseId);
+
+    res.json({ message: 'Evidence submitted. Awaiting admin verification.', proof });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/purchases/my', authMiddleware, async (req, res) => {
+  const { data } = await supabase.from('purchases').select('*, payment_proofs(*)').eq('user_id', req.user.id).order('created_at', { ascending: false });
+  res.json(data);
+});
+
+// ========== ADMIN - PAYMENT VERIFICATION ==========
+app.get('/api/admin/purchases/pending', authMiddleware, adminOnly, async (req, res) => {
+  const { data } = await supabase.from('purchases').select('*, users(full_name,email), payment_proofs(*)').in('status', ['evidence_submitted','pending_verification']).order('created_at');
+  res.json(data);
+});
+
+app.post('/api/admin/purchases/:id/approve', authMiddleware, ownerOnly, async (req, res) => {
+  try {
+    const purchaseId = req.params.id;
+    const { data: purchase } = await supabase.from('purchases').select('*, users(*)').eq('id', purchaseId).single();
+    if (!purchase) return res.status(404).json({ error: 'Not found' });
+
+    await supabase.from('purchases').update({ status: 'approved', approved_by: req.user.id, approved_at: new Date().toISOString() }).eq('id', purchaseId);
+
+    // Activate membership
+    await supabase.from('user_memberships').upsert({
+      user_id: purchase.user_id, membership_id: purchase.membership_id, tier: purchase.tier, network: purchase.network, is_active: true, activated_at: new Date().toISOString()
+    }, { onConflict: 'user_id,tier,network' });
+
+    // Unlock referral & withdrawal via trigger - but also ensure via update (trigger handles it)
+    // Check referral qualification
+    const { data: referral } = await supabase.from('referrals').select('*, users!referrals_referrer_id_fkey(is_referral_eligible)').eq('referred_id', purchase.user_id).single();
+    if (referral && !referral.is_qualified) {
+      // Check referrer has active membership
+      const { data: referrerMembership } = await supabase.from('user_memberships').select('id').eq('user_id', referral.referrer_id).eq('is_active', true).limit(1);
+      if (referrerMembership?.length) {
+        // Get reward amount
+        const { data: setting } = await supabase.from('referral_settings').select('*').eq('is_active', true).order('created_at', { ascending: false }).limit(1).single();
+        const reward = setting?.reward_amount_ngn || 500;
+        const txnRef = 'RW-' + Date.now() + '-' + Math.random().toString(36).substring(2,5).toUpperCase();
+        const walletTxnRef = 'WT-' + Date.now() + '-' + Math.random().toString(36).substring(2,5).toUpperCase();
+
+        // Credit wallet
+        const { data: wallet } = await supabase.from('wallets').select('*').eq('user_id', referral.referrer_id).single();
+        if (wallet) {
+          await supabase.from('wallets').update({
+            available_balance: wallet.available_balance + reward,
+            total_earned: wallet.total_earned + reward
+          }).eq('user_id', referral.referrer_id);
+
+          const { data: wt } = await supabase.from('wallet_transactions').insert({
+            transaction_reference: walletTxnRef, user_id: referral.referrer_id, amount: reward, direction: 'credit', type: 'referral_reward',
+            reason: `Referral reward for ${purchase.users?.full_name || purchase.user_id}`, related_purchase_id: purchase.id, performed_by: req.user.id, performed_by_role: 'owner'
+          }).select().single();
+
+          await supabase.from('referral_rewards').insert({
+            transaction_reference: txnRef, referrer_id: referral.referrer_id, referred_id: purchase.user_id, qualifying_purchase_id: purchase.id,
+            reward_amount_ngn: reward, referral_setting_id: setting?.id, wallet_transaction_id: wt?.id
+          });
+
+          await supabase.from('referrals').update({ is_qualified: true, qualified_at: new Date().toISOString(), qualifying_purchase_id: purchase.id }).eq('id', referral.id);
+        }
+      }
+    }
+
+    // Notification
+    await supabase.from('notifications').insert({
+      user_id: purchase.user_id, title: 'Membership Approved', message: `Your ${purchase.network} ${purchase.tier} membership is now active. Your referral code is now unlocked!`, type: 'membership_approved', related_reference: purchase.purchase_reference
+    });
+
+    // Audit log
+    await supabase.from('audit_logs').insert({ admin_id: req.user.id, action: 'approve_purchase', affected_table: 'purchases', affected_id: purchaseId, new_value: { status: 'approved' } });
+
+    res.json({ message: 'Approved, membership activated, referral unlocked if qualified' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/purchases/:id/decline', authMiddleware, ownerOnly, async (req, res) => {
+  const { reason } = req.body;
+  await supabase.from('purchases').update({ status: 'declined', declined_reason: reason }).eq('id', req.params.id);
+  const { data: purchase } = await supabase.from('purchases').select('user_id, purchase_reference').eq('id', req.params.id).single();
+  if (purchase) await supabase.from('notifications').insert({ user_id: purchase.user_id, title: 'Payment Declined', message: `Your payment ${purchase.purchase_reference} was declined. Reason: ${reason}. You can submit again during countdown.`, type: 'payment_declined' });
+  res.json({ message: 'Declined' });
+});
+
+// ========== WALLET ==========
+app.get('/api/wallet', authMiddleware, async (req, res) => {
+  const { data: wallet } = await supabase.from('wallets').select('*').eq('user_id', req.user.id).single();
+  const { data: transactions } = await supabase.from('wallet_transactions').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false }).limit(20);
+  const { data: user } = await supabase.from('users').select('is_referral_eligible, is_withdrawal_eligible').eq('id', req.user.id).single();
+  res.json({ wallet, transactions, eligibility: user });
+});
+
+// ========== WITHDRAWALS - WITH MANUAL/AUTO TOGGLE ==========
+app.get('/api/system/withdrawal-mode', async (req, res) => {
+  const { data } = await supabase.from('system_settings').select('value').eq('key', 'withdrawal_mode').single();
+  res.json({ mode: data?.value ? JSON.parse(data.value) : 'manual' });
+});
+
+app.post('/api/admin/settings/withdrawal-mode', authMiddleware, ownerOnly, async (req, res) => {
+  const { mode } = req.body; // auto or manual
+  if (!['auto','manual'].includes(mode)) return res.status(400).json({ error: 'Mode must be auto or manual' });
+  const { data: old } = await supabase.from('system_settings').select('value').eq('key', 'withdrawal_mode').single();
+  await supabase.from('system_settings').update({ value: JSON.stringify(mode), updated_by: req.user.id }).eq('key', 'withdrawal_mode');
+  await supabase.from('system_settings_history').insert({ key: 'withdrawal_mode', old_value: old?.value, new_value: JSON.stringify(mode), changed_by: req.user.id });
+  await supabase.from('audit_logs').insert({ admin_id: req.user.id, action: 'change_withdrawal_mode', affected_table: 'system_settings', previous_value: old?.value, new_value: JSON.stringify(mode) });
+  res.json({ message: `Withdrawal mode switched to ${mode}. ${mode === 'manual' ? 'Auto is now OFF' : 'Manual is now OFF'}`, mode });
+});
+
+app.post('/api/withdrawals/request', authMiddleware, async (req, res) => {
+  try {
+    const { bank_name, account_number, account_name, amount_ngn, transaction_pin } = req.body;
+    if (!bank_name || !account_number || !account_name || !amount_ngn) return res.status(400).json({ error: 'Bank details and amount required' });
+
+    // Check withdrawal eligibility - BACKEND ENFORCES UNLOCK RULE
+    const { data: user } = await supabase.from('users').select('is_withdrawal_eligible, is_email_verified').eq('id', req.user.id).single();
+    if (!user?.is_withdrawal_eligible) return res.status(403).json({ error: 'Withdrawal locked. You must purchase and get approved membership first to unlock withdrawal.' });
+
+    const { data: wallet } = await supabase.from('wallets').select('*').eq('user_id', req.user.id).single();
+    if (!wallet || wallet.available_balance < amount_ngn) return res.status(400).json({ error: 'Insufficient balance' });
+
+    // Get current withdrawal mode
+    const { data: modeSetting } = await supabase.from('system_settings').select('value').eq('key', 'withdrawal_mode').single();
+    const currentMode = modeSetting?.value ? JSON.parse(modeSetting.value) : 'manual';
+
+    // Transaction PIN check if enabled
+    const { data: pinFlag } = await supabase.from('feature_flags').select('is_enabled').eq('key', 'require_transaction_pin').single();
+    if (pinFlag?.is_enabled) {
+      const { data: userWithPin } = await supabase.from('users').select('transaction_pin_hash').eq('id', req.user.id).single();
+      if (userWithPin?.transaction_pin_hash) {
+        const bcrypt = require('bcryptjs');
+        const valid = await bcrypt.compare(transaction_pin || '', userWithPin.transaction_pin_hash);
+        if (!valid) return res.status(400).json({ error: 'Invalid transaction PIN' });
+      }
+    }
+
+    const withdrawal_reference = 'WD-' + Date.now() + '-' + Math.random().toString(36).substring(2,5).toUpperCase();
+
+    // Reserve funds
+    await supabase.from('wallets').update({
+      available_balance: wallet.available_balance - amount_ngn,
+      reserved_balance: wallet.reserved_balance + amount_ngn
+    }).eq('user_id', req.user.id);
+
+    // Create bank account record if not exists
+    await supabase.from('bank_accounts').upsert({ user_id: req.user.id, bank_name, account_number, account_name, is_verified: false }, { onConflict: 'user_id,account_number' });
+
+    const { data: withdrawal, error } = await supabase.from('withdrawals').insert({
+      withdrawal_reference, user_id: req.user.id, bank_name, account_number, account_name,
+      amount_ngn, mode: currentMode, status: currentMode === 'manual' ? 'pending_manual' : 'pending'
+    }).select().single();
+    if (error) throw error;
+
+    // Wallet transaction - reserve
+    await supabase.from('wallet_transactions').insert({
+      transaction_reference: 'WT-' + Date.now() + Math.random().toString(36).substring(2,5).toUpperCase(),
+      user_id: req.user.id, amount: amount_ngn, direction: 'debit', type: 'withdrawal', reason: `Withdrawal request ${withdrawal_reference} - ${currentMode} mode`, related_withdrawal_id: withdrawal.id, status: 'pending'
+    });
+
+    res.json({ message: `Withdrawal submitted in ${currentMode} mode. ${currentMode === 'manual' ? 'Admin will transfer manually and mark as paid.' : 'System will transfer automatically.'}`, withdrawal });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/withdrawals/my', authMiddleware, async (req, res) => {
+  const { data } = await supabase.from('withdrawals').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+  res.json(data);
+});
+
+app.get('/api/admin/withdrawals', authMiddleware, adminOnly, async (req, res) => {
+  const { data } = await supabase.from('withdrawals').select('*, users(full_name,email)').order('created_at', { ascending: false });
+  res.json(data);
+});
+
+app.post('/api/admin/withdrawals/:id/mark-paid', authMiddleware, ownerOnly, async (req, res) => {
+  try {
+    const { admin_transfer_reference, admin_transfer_proof_url, admin_notes } = req.body;
+    const { data: withdrawal } = await supabase.from('withdrawals').select('*, wallets!inner(*)').eq('id', req.params.id).single();
+    if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
+
+    await supabase.from('withdrawals').update({
+      status: 'completed', admin_transfer_reference, admin_transfer_proof_url, marked_paid_by: req.user.id, marked_paid_at: new Date().toISOString(), admin_notes, provider_reference: admin_transfer_reference
+    }).eq('id', req.params.id);
+
+    // Finalize - move reserved to withdrawn
+    const { data: wallet } = await supabase.from('wallets').select('*').eq('user_id', withdrawal.user_id).single();
+    await supabase.from('wallets').update({
+      reserved_balance: wallet.reserved_balance - withdrawal.amount_ngn,
+      total_withdrawn: wallet.total_withdrawn + withdrawal.amount_ngn
+    }).eq('user_id', withdrawal.user_id);
+
+    await supabase.from('wallet_transactions').update({ status: 'completed' }).eq('related_withdrawal_id', withdrawal.id);
+
+    await supabase.from('notifications').insert({
+      user_id: withdrawal.user_id, title: 'Withdrawal Completed', message: `Your withdrawal of ₦${withdrawal.amount_ngn} to ${withdrawal.bank_name} ${withdrawal.account_number} has been completed. Ref: ${withdrawal.withdrawal_reference}`, type: 'withdrawal_completed'
+    });
+
+    res.json({ message: 'Marked as paid - manual transfer completed' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========== REFERRALS ==========
+app.get('/api/referrals/my', authMiddleware, async (req, res) => {
+  const { data: user } = await supabase.from('users').select('is_referral_eligible, referral_code').eq('id', req.user.id).single();
+  if (!user.is_referral_eligible) return res.json({ message: 'Referral locked. Purchase membership to unlock.', is_eligible: false, referral_code: null });
+
+  const { data: referrals } = await supabase.from('referrals').select('*, users!referrals_referred_id_fkey(full_name, email, created_at)').eq('referrer_id', req.user.id);
+  const { data: rewards } = await supabase.from('referral_rewards').select('*').eq('referrer_id', req.user.id);
+  res.json({ is_eligible: true, referral_code: user.referral_code, referrals, rewards, total_earned: rewards?.reduce((s,r)=>s+r.reward_amount_ngn,0) || 0 });
+});
+
+// ========== ADMIN - USERS ==========
+app.get('/api/admin/users', authMiddleware, adminOnly, async (req, res) => {
+  const { data } = await supabase.from('users').select('id, full_name, email, referral_code, is_email_verified, is_referral_eligible, is_withdrawal_eligible, is_active, created_at').is('deleted_at', null).order('created_at', { ascending: false }).limit(100);
+  res.json(data);
+});
+
+module.exports = app;
